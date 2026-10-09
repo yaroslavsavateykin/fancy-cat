@@ -24,6 +24,12 @@ randomised IDs), avoiding tmux truecolour downgrades. Placement ID 1 is bound vi
 underline colour. Row/column diacritics follow the Kitty protocol table, also
 used in gominimal/kittyview. Glyph storage remains alive across vaxis frames.
 
+While tmux file monitoring is enabled, the ticker also checks the PDF path's
+inode, size and modification time. This survives an inode watcher stopping after
+unlink/recreate or atomic replacement. Reload waits for 250ms of stable metadata;
+the previous page remains available while the output is temporarily absent.
+The status path also tolerates temporary file absence.
+
 Pixel geometry comes from TIOCGWINSZ; if missing, the outer client cell geometry
 is queried from tmux, with an 8x16 fallback. Resize and PDF filewatch invalidate
 rasterisation. The tmux backend does not use vaxis's direct-placement image cache;

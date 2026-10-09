@@ -21,6 +21,7 @@ pub const Event = union(enum) {
     reload_done: usize,
     graphics_response: struct { id: u32, ok: bool },
     graphics_tick,
+    document_ready,
 };
 
 pub const ModeType = enum { view, command };
@@ -57,6 +58,8 @@ pub const Context = struct {
     pending_resize: ?vaxis.Winsize = null,
     resize_at: i64 = 0,
     retired_image: ?u32 = null,
+    observed_pdf: ?std.fs.File.Stat = null,
+    pdf_change_at: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, args: [][:0]u8) !Self {
         const path = args[1];
@@ -108,6 +111,7 @@ pub const Context = struct {
             .reload_indicator_active = false,
             .buf = buf,
             .tmux_graphics = if (std.posix.getenv("TMUX") != null) Tmux.init(allocator) else null,
+            .observed_pdf = std.fs.cwd().statFile(path) catch null,
         };
     }
 
@@ -151,8 +155,12 @@ pub const Context = struct {
         }
     }
 
-    fn watcherWorker(self: *Self, watcher: *fzwatch.Watcher) !void {
-        try watcher.start(.{ .latency = self.config.file_monitor.latency });
+    fn watcherWorker(self: *Self, watcher: *fzwatch.Watcher) void {
+        watcher.start(.{ .latency = self.config.file_monitor.latency }) catch |err| {
+            // File replacement can invalidate the inode watch. In tmux the
+            // ticker still polls the path, so a watcher error is not fatal.
+            if (self.tmux_graphics == null) std.log.warn("file watcher stopped: {}", .{err});
+        };
     }
 
     pub fn run(self: *Self) !void {
@@ -281,6 +289,25 @@ pub const Context = struct {
             .mouse => |mouse| self.mouse = mouse,
             .graphics_response => {},
             .graphics_tick => {
+                if (self.config.file_monitor.enabled) {
+                    const stat = std.fs.cwd().statFile(self.document_handler.getPath()) catch null;
+                    if (stat) |current| {
+                        const changed = if (self.observed_pdf) |old| old.inode != current.inode or old.size != current.size or old.mtime != current.mtime else true;
+                        if (changed) {
+                            self.observed_pdf = current;
+                            self.pdf_change_at = std.time.milliTimestamp();
+                        } else if (self.pdf_change_at) |at| {
+                            if (std.time.milliTimestamp() - at >= 250) {
+                                try self.update(.document_ready);
+                                self.pdf_change_at = null;
+                            }
+                        }
+                    } else {
+                        // A compiler may unlink the old output before creating
+                        // its replacement. Keep checking the path, not its inode.
+                        self.observed_pdf = null;
+                    }
+                }
                 const output = std.process.Child.run(.{ .allocator = self.allocator, .argv = &.{ "tmux", "display-message", "-p", "-t", std.posix.getenv("TMUX_PANE") orelse "", "#{window_active} #{session_attached} #{pane_active}" } }) catch return;
                 defer self.allocator.free(output.stdout);
                 defer self.allocator.free(output.stderr);
@@ -319,6 +346,11 @@ pub const Context = struct {
                 }
             },
             .file_changed => {
+                if (self.tmux_graphics != null) {
+                    self.pdf_change_at = std.time.milliTimestamp();
+                } else try self.update(.document_ready);
+            },
+            .document_ready => {
                 try self.document_handler.reloadDocument();
                 self.cache.clear();
                 self.reload_page = true;
@@ -538,7 +570,10 @@ pub const Context = struct {
             const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
             defer allocator.free(cwd);
 
-            const full_path = try std.fs.cwd().realpathAlloc(allocator, self.document_handler.getPath());
+            const full_path = std.fs.cwd().realpathAlloc(allocator, self.document_handler.getPath()) catch |err| switch (err) {
+                error.FileNotFound => try std.fs.path.resolve(allocator, &.{ cwd, self.document_handler.getPath() }),
+                else => return err,
+            };
             defer allocator.free(full_path);
 
             if (std.mem.startsWith(u8, full_path, cwd)) {

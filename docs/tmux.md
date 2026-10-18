@@ -15,13 +15,15 @@ Run in the selected pane of a terminal implementing Kitty **Unicode placeholders
 DCS envelopes (`ESC P tmux;`, doubled inner ESCs, `ESC \\`). A real 1x1 RGB
 query must receive an `OK`; environment variables alone never grant graphics
 capability. The input parser preserves image IDs and positive/negative replies.
-Transmit and virtual placement commands require acknowledgements and retry
-losses around tmux redraws. Text, cursor movement and placeholder cells are
+Focused transmit and placement commands retry at most twice with 150ms ACK
+budgets. Visible unfocused panes suppress replies and do not wait: tmux routes
+terminal replies to the active pane, potentially an unrelated TUI such as pi. Text, cursor movement and placeholder cells are
 never passthrough wrapped.
 
-Image IDs use indexed foreground colour plus a high-byte diacritic (65,280
-randomised IDs), avoiding tmux truecolour downgrades. Placement ID 1 is bound via
-underline colour. Row/column diacritics follow the Kitty protocol table, also
+Image IDs use explicit RGB foreground plus a high-byte diacritic (65,280
+randomised IDs). This requires an RGB-capable tmux client and avoids palette
+expansion of indexed foreground on xterm-ghostty. Default underline colour
+selects the image's sole virtual placement, avoiding placement-ID conversion. Row/column diacritics follow the Kitty protocol table, also
 used in gominimal/kittyview. Glyph storage remains alive across vaxis frames.
 
 While tmux file monitoring is enabled, the ticker also checks the PDF path's
@@ -36,8 +38,8 @@ rasterisation. The tmux backend does not use vaxis's direct-placement image cach
 it deletes replaced image data to avoid an unbounded terminal image store.
 
 A 250ms visibility/focus tick handles hidden windows and detached clients.
-Graphics transmissions are deferred while the pane is inactive: terminal replies
-are routed by tmux to the active pane. Returning focus retransmits and redraws.
+Graphics transmissions are deferred only while the window is hidden; visible
+unfocused panes can update without ACKs. Returning focus retransmits and redraws.
 Existing placeholders in an inactive pane remain ordinary tmux text and repaint
 with the client. Transient transmission/placement failures do not quit the app.
 Following successful drawing, `tmux refresh-client` repairs the in-place

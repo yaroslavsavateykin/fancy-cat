@@ -242,9 +242,12 @@ pub const Context = struct {
                 self.retired_image = null;
             }
             if (self.tmux_graphics != null and self.image_changed) {
+                // Let tmux drain placeholder cells before a forced client
+                // repaint; refreshing immediately can discard pending DCS.
+                std.Thread.sleep(20 * std.time.ns_per_ms);
                 Tmux.refresh(self.allocator);
                 self.image_changed = false;
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std.Thread.sleep(30 * std.time.ns_per_ms);
             }
 
             _ = self.arena.reset(.retain_capacity); // clear key actions from heap
@@ -311,8 +314,11 @@ pub const Context = struct {
                 const output = std.process.Child.run(.{ .allocator = self.allocator, .argv = &.{ "tmux", "display-message", "-p", "-t", std.posix.getenv("TMUX_PANE") orelse "", "#{window_active} #{session_attached} #{pane_active}" } }) catch return;
                 defer self.allocator.free(output.stdout);
                 defer self.allocator.free(output.stderr);
-                const visible = std.mem.startsWith(u8, output.stdout, "1 ") and !std.mem.startsWith(u8, output.stdout, "1 0") and std.mem.endsWith(u8, std.mem.trim(u8, output.stdout, "\r\n"), " 1");
-                if (visible and !self.graphics_visible) {
+                const visible = std.mem.startsWith(u8, output.stdout, "1 ") and !std.mem.startsWith(u8, output.stdout, "1 0");
+                const focused = std.mem.endsWith(u8, std.mem.trim(u8, output.stdout, "\r\n"), " 1");
+                const focus_returned = if (self.tmux_graphics) |graphics| focused and !graphics.require_ack else false;
+                if (self.tmux_graphics) |*graphics| graphics.require_ack = focused;
+                if (visible and (!self.graphics_visible or focus_returned)) {
                     // A client may have detached/re-attached or a hidden PDF may
                     // have changed. Re-send; don't assume its image store survived.
                     self.reload_page = true;

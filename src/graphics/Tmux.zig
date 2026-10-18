@@ -6,6 +6,7 @@ const diacritics = @import("diacritics.zig").values;
 const Self = @This();
 allocator: std.mem.Allocator,
 next: u32,
+require_ack: bool = true,
 glyphs: std.AutoHashMap(u32, []u8),
 
 pub fn init(allocator: std.mem.Allocator) Self {
@@ -28,7 +29,7 @@ pub fn packet(writer: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 fn waitAck(vx: *vaxis.Vaxis, id: u32) bool {
-    for (0..100) |_| {
+    for (0..15) |_| {
         const ack = vx.graphics_ack.load(.acquire);
         if (ack >> 2 == id) return ack & 3 == 1;
         std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -55,16 +56,15 @@ pub fn probe(self: *Self, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
 fn allocateId(self: *Self) u32 {
     const n = self.next % 65280;
     self.next = (self.next + 1) % 65280;
-    // Indexed foreground survives tmux's truecolour downgrade. High byte is
-    // carried in a third diacritic (kittyview's MuxSafe ID space).
+    // High byte is carried in a third diacritic. The remaining byte fits
+    // both indexed and RGB foreground representations.
     return ((n / 255) << 24) | (n % 255 + 1);
 }
 
 pub fn transmit(self: *Self, vx: *vaxis.Vaxis, writer: *std.Io.Writer, data: []const u8, width: u16, height: u16) !vaxis.Image {
     const image_id = self.allocateId();
-    // tmux can discard a whole DCS packet during a pending redraw. q=0 gives
-    // us the final transmission ACK; retransmitting the same ID is idempotent.
-    for (0..4) |_| {
+    // Keep retries bounded: tmux can discard DCS during a client redraw.
+    for (0..2) |_| {
         vx.graphics_ack.store(0, .release);
         var offset: usize = 0;
         while (offset < data.len) {
@@ -72,27 +72,25 @@ pub fn transmit(self: *Self, vx: *vaxis.Vaxis, writer: *std.Io.Writer, data: []c
             const more: u8 = if (end < data.len) 1 else 0;
             var buf: [4352]u8 = undefined;
             const seq = if (offset == 0)
-                try std.fmt.bufPrint(&buf, "\x1b_Ga=t,t=d,f=24,q=0,i={d},s={d},v={d},m={d};{s}\x1b\\", .{ image_id, width, height, more, data[offset..end] })
+                try std.fmt.bufPrint(&buf, "\x1b_Ga=t,t=d,f=24,q={d},i={d},s={d},v={d},m={d};{s}\x1b\\", .{ if (self.require_ack) @as(u8, 0) else @as(u8, 2), image_id, width, height, more, data[offset..end] })
             else
                 try std.fmt.bufPrint(&buf, "\x1b_Gm={d};{s}\x1b\\", .{ more, data[offset..end] });
             try packet(writer, seq);
             offset = end;
         }
         try writer.flush();
-        if (waitAck(vx, image_id)) return .{ .id = image_id, .width = width, .height = height };
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        if (!self.require_ack or waitAck(vx, image_id)) return .{ .id = image_id, .width = width, .height = height };
     }
     return error.GraphicsTransmissionFailed;
 }
 
-pub fn place(_: *Self, vx: *vaxis.Vaxis, writer: *std.Io.Writer, image: vaxis.Image, cols: u16, rows: u16) !void {
+pub fn place(self: *Self, vx: *vaxis.Vaxis, writer: *std.Io.Writer, image: vaxis.Image, cols: u16, rows: u16) !void {
     var buf: [160]u8 = undefined;
-    for (0..4) |_| {
+    for (0..2) |_| {
         vx.graphics_ack.store(0, .release);
-        try packet(writer, try std.fmt.bufPrint(&buf, "\x1b_Ga=p,U=1,i={d},p=1,c={d},r={d},q=0\x1b\\", .{ image.id, cols, rows }));
+        try packet(writer, try std.fmt.bufPrint(&buf, "\x1b_Ga=p,U=1,i={d},p=1,c={d},r={d},q={d}\x1b\\", .{ image.id, cols, rows, if (self.require_ack) @as(u8, 0) else @as(u8, 2) }));
         try writer.flush();
-        if (waitAck(vx, image.id)) return;
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        if (!self.require_ack or waitAck(vx, image.id)) return;
     }
     return error.GraphicsPlacementFailed;
 }
@@ -115,7 +113,10 @@ pub fn draw(self: *Self, win: vaxis.Window, image_id: u32) !void {
             if (!entry.found_existing) entry.value_ptr.* = try self.allocator.dupe(u8, buf[0..n]);
             win.writeCell(@intCast(col), @intCast(row), .{
                 .char = .{ .grapheme = entry.value_ptr.*, .width = 1 },
-                .style = .{ .fg = .{ .index = @truncate(image_id) }, .ul = .{ .index = 1 } },
+                // Explicit RGB preserves the numeric image ID with RGB-capable
+                // clients. tmux can palette-expand indexed SGR for xterm-ghostty.
+                // Default underline selects the image's sole virtual placement.
+                .style = .{ .fg = .{ .rgb = .{ 0, 0, @truncate(image_id) } } },
             });
         }
     }
